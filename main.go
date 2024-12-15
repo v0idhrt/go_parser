@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
@@ -18,7 +20,18 @@ import (
 	"github.com/yosssi/gohtml"
 )
 
-const userAgent = "GoScaperBot"
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 14_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+}
+
+func getRandomUserAgent() string {
+	rand.New(rand.NewSource(time.Now().Unix()))
+	return userAgents[rand.Intn(len(userAgents))]
+}
 
 func getSiteBaseDir(targetURL string) (string, error) {
 	parsedURL, err := url.Parse(targetURL)
@@ -36,6 +49,7 @@ func getSiteBaseDir(targetURL string) (string, error) {
 }
 
 func isAllowed(targetURL string) bool {
+	userAgent := getRandomUserAgent()
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return false
@@ -57,16 +71,32 @@ func isAllowed(targetURL string) bool {
 }
 
 func fetchPageWithJS(targetURL string) (*goquery.Document, error) {
-	ctx, cancel := chromedp.NewContext(context.Background())
+	userAgent := getRandomUserAgent()
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.UserAgent(userAgent),
+	)
+
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+
+	ctx, cancel := context.WithTimeout(allocCtx, 60*time.Second)
+	defer cancel()
+
+	browserCtx, cancel := chromedp.NewContext(ctx)
 	defer cancel()
 
 	var htmlContent string
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(targetURL),
-		chromedp.OuterHTML("html", &htmlContent))
 
+	err := chromedp.Run(browserCtx,
+		chromedp.Navigate(targetURL),
+		chromedp.Sleep(3*time.Second),
+		chromedp.WaitVisible("body", chromedp.ByQuery),
+		chromedp.OuterHTML("html", &htmlContent),
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error fetching page: %v", err)
 	}
 
 	return goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
@@ -120,16 +150,25 @@ func saveCSSToFile(cssContent, filePath string) error {
 }
 
 func saveJSToFile(jsContent, filePath string) error {
+	loader := api.LoaderJS
+	if strings.HasSuffix(filePath, ".jsx") || strings.Contains(jsContent, "<") {
+		loader = api.LoaderJSX
+	}
+
 	result := api.Transform(jsContent, api.TransformOptions{
-		Loader:            api.LoaderJS,
+		Loader:            loader,
 		Format:            api.FormatDefault,
 		MinifyWhitespace:  false,
 		MinifyIdentifiers: false,
 		MinifySyntax:      false,
+		Target:            api.ESNext,
 	})
 	if len(result.Errors) > 0 {
-		return fmt.Errorf("failed to format JS: %v", result.Errors)
+		fmt.Printf("Warning: Failed to format JS/JSX (%s), saving as is: %v\n", filePath, result.Errors)
+		return saveToFile(jsContent, filePath)
 	}
+
+	// Сохраняем форматированный JS-код
 	return saveToFile(string(result.Code), filePath)
 }
 
@@ -221,7 +260,10 @@ func resolveURL(baseURL, relativeURL string) string {
 }
 
 func main() {
-	targetURL := "https://wfolio.ru/"
+	var targetURL string
+
+	fmt.Print("Дай ссылку: ")
+	fmt.Fscan(os.Stdin, &targetURL)
 
 	err := parseAndDownload(targetURL)
 	if err != nil {
